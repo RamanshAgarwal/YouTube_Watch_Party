@@ -700,11 +700,19 @@ io.on("connection", (socket) => {
         // ===============================
 
         if (Object.keys(room.participants).length === 0) {
+            // Keep the room in MongoDB so it can be recovered
+            // when the user refreshes or reconnects.
+            await persistRoom(room);
+
             delete rooms[roomId];
 
-            await roomService.deleteRoom(roomId);
+            console.log(
+                `🧹 Room removed from active memory: ${roomId}`
+            );
 
-            console.log(`🧹 Room cleaned up: ${roomId}`);
+            console.log(
+                `💾 Room kept in MongoDB for future rejoin: ${roomId}`
+            );
 
             return;
         }

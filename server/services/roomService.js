@@ -27,7 +27,7 @@ class RoomService {
                     participants: participantsArray,
                     lastActive: new Date()
                 },
-                { upsert: true, new: true }
+                { upsert: true, returnDocument: "after" }
             );
         } catch (error) {
             console.error(`Error saving room ${roomData.roomId} to DB:`, error.message);

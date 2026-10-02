@@ -15,6 +15,7 @@ app.use(cors({
     origin: CLIENT_URL,
     credentials: true
 }));
+
 app.use(express.json());
 
 const server = http.createServer(app);
@@ -26,10 +27,17 @@ const io = new Server(server, {
     }
 });
 
-// Connect Database asynchronously
+// ===============================
+// DATABASE CONNECTION
+// ===============================
+
 connectDB().then((connected) => {
     roomService.setDbConnected(connected);
 });
+
+// ===============================
+// HEALTH CHECK
+// ===============================
 
 app.get("/", (req, res) => {
     res.json({
@@ -40,8 +48,9 @@ app.get("/", (req, res) => {
 });
 
 // ===============================
-// IN-MEMORY ROOM STORE
+// IN-MEMORY ACTIVE ROOM STORE
 // ===============================
+
 const rooms = {};
 
 // ===============================
@@ -65,19 +74,37 @@ function getCurrentTime(room) {
     return room.currentTime;
 }
 
-// Broadcast updated participant list to room
+// Save the latest room state to MongoDB
+async function persistRoom(room) {
+    if (!room) return;
+
+    // When video is playing, store the exact current position
+    // instead of the old position from when playback started.
+    if (room.isPlaying) {
+        room.currentTime = getCurrentTime(room);
+        room.startedAt = Date.now();
+    }
+
+    await roomService.saveRoom(room);
+}
+
+// Broadcast updated participant list
 function sendParticipants(roomId) {
     const room = rooms[roomId];
+
     if (!room) return;
 
     const participants = Object.values(room.participants);
+
     io.to(roomId).emit("participants_updated", participants);
 
-    // Asynchronously update DB metadata
-    roomService.saveRoom(room);
+    // Persist participant changes
+    persistRoom(room).catch((error) => {
+        console.error("❌ Failed to persist room:", error.message);
+    });
 }
 
-// Send full room state snapshot to a client
+// Send complete room state to a client
 function sendSyncState(socket, room) {
     socket.emit("sync_state", {
         videoId: room.videoId,
@@ -89,16 +116,17 @@ function sendSyncState(socket, room) {
 }
 
 // ===============================
-// SOCKET CONNECTION & HANDLERS
+// SOCKET CONNECTION
 // ===============================
 
 io.on("connection", (socket) => {
     console.log(`🔌 User connected: ${socket.id}`);
 
-    // -------------------------------
+    // ===============================
     // CREATE ROOM
-    // -------------------------------
-    socket.on("create_room", (data) => {
+    // ===============================
+
+    socket.on("create_room", async (data) => {
         let roomId;
         let username = "Host";
 
@@ -116,9 +144,26 @@ io.on("connection", (socket) => {
 
         const cleanRoomId = roomId.trim().toUpperCase();
 
+        // Check active in-memory room
         if (rooms[cleanRoomId]) {
-            socket.emit("room_error", "Room already exists. Please choose another ID or join.");
+            socket.emit(
+                "room_error",
+                "Room already exists. Please choose another ID or join."
+            );
             return;
+        }
+
+        // Check MongoDB too
+        if (roomService.dbConnected) {
+            const existingRoom = await roomService.getRoom(cleanRoomId);
+
+            if (existingRoom) {
+                socket.emit(
+                    "room_error",
+                    "Room already exists. Please choose another ID or join."
+                );
+                return;
+            }
         }
 
         rooms[cleanRoomId] = {
@@ -147,12 +192,14 @@ io.on("connection", (socket) => {
         console.log(`👑 ${username} created room: ${cleanRoomId}`);
 
         socket.emit("room_created", cleanRoomId);
+
         sendParticipants(cleanRoomId);
     });
 
-    // -------------------------------
+    // ===============================
     // JOIN ROOM
-    // -------------------------------
+    // ===============================
+
     socket.on("join_room", async (data) => {
         let roomId;
         let username = "Participant";
@@ -170,62 +217,101 @@ io.on("connection", (socket) => {
         }
 
         const cleanRoomId = roomId.trim().toUpperCase();
+
         let room = rooms[cleanRoomId];
 
-        // Fallback to database if server restarted
+        // ===============================
+        // RECOVER ROOM FROM DATABASE
+        // ===============================
+
         if (!room && roomService.dbConnected) {
             const dbRoom = await roomService.getRoom(cleanRoomId);
+
             if (dbRoom) {
+                /*
+                 * Socket IDs from a previous server session are no longer valid.
+                 * Therefore, the first person recovering a persisted room becomes
+                 * the new host.
+                 */
+
                 rooms[cleanRoomId] = {
                     roomId: dbRoom.roomId,
                     videoId: dbRoom.videoId,
                     currentTime: dbRoom.currentTime,
                     isPlaying: dbRoom.isPlaying,
                     startedAt: dbRoom.startedAt,
-                    hostId: socket.id, // Reassigning host if old host disconnected
+                    hostId: socket.id,
                     participants: {},
                     chatMessages: []
                 };
+
                 room = rooms[cleanRoomId];
+
+                // The room is being brought back into the active memory store.
+                // Reset playback timer if it was playing while server was offline.
+                if (room.isPlaying) {
+                    room.isPlaying = false;
+                    room.startedAt = null;
+                }
+
+                console.log(`♻️ Room recovered from MongoDB: ${cleanRoomId}`);
             }
         }
 
         if (!room) {
-            socket.emit("room_error", "Room does not exist. Check the code and try again.");
+            socket.emit(
+                "room_error",
+                "Room does not exist. Check the code and try again."
+            );
             return;
         }
 
         socket.join(cleanRoomId);
         socket.roomId = cleanRoomId;
-        socket.role = "participant";
+
+        // If this is a recovered room, first user becomes host.
+        if (room.hostId === socket.id) {
+            socket.role = "host";
+        } else {
+            socket.role = "participant";
+        }
+
         socket.username = username;
 
         room.participants[socket.id] = {
             userId: socket.id,
             username: username,
-            role: "participant",
+            role: socket.role,
             joinedAt: new Date()
         };
 
-        console.log(`👤 ${username} joined room: ${cleanRoomId}`);
+        console.log(
+            `👤 ${username} joined room: ${cleanRoomId} as ${socket.role}`
+        );
 
         socket.emit("room_joined", cleanRoomId);
+
         sendSyncState(socket, room);
+
         sendParticipants(cleanRoomId);
 
         socket.to(cleanRoomId).emit("user_joined", {
             userId: socket.id,
             username: username,
-            role: "participant"
+            role: socket.role
         });
     });
 
-    // -------------------------------
+    // ===============================
     // LOAD / CHANGE VIDEO
-    // -------------------------------
-    const handleVideoChange = (videoId) => {
+    // ===============================
+
+    const handleVideoChange = async (videoId) => {
         if (!canControl(socket)) {
-            socket.emit("permission_denied", "Only Host or Moderator can change the video.");
+            socket.emit(
+                "permission_denied",
+                "Only Host or Moderator can change the video."
+            );
             return;
         }
 
@@ -233,27 +319,41 @@ io.on("connection", (socket) => {
             return;
         }
 
+        if (typeof videoId !== "string" || !videoId.trim()) {
+            return;
+        }
+
         const room = rooms[socket.roomId];
+
         room.videoId = videoId;
         room.currentTime = 0;
         room.isPlaying = false;
         room.startedAt = null;
 
-        console.log(`🎬 ${socket.username} loaded video: ${videoId} in room ${socket.roomId}`);
+        console.log(
+            `🎬 ${socket.username} loaded video: ${videoId} in room ${socket.roomId}`
+        );
 
         io.to(socket.roomId).emit("video_loaded", videoId);
+
+        await persistRoom(room);
+
         sendParticipants(socket.roomId);
     };
 
     socket.on("load_video", handleVideoChange);
     socket.on("change_video", handleVideoChange);
 
-    // -------------------------------
+    // ===============================
     // PLAY VIDEO
-    // -------------------------------
-    socket.on("video_play", (time) => {
+    // ===============================
+
+    socket.on("video_play", async (time) => {
         if (!canControl(socket)) {
-            socket.emit("permission_denied", "Participants cannot control video playback.");
+            socket.emit(
+                "permission_denied",
+                "Participants cannot control video playback."
+            );
             return;
         }
 
@@ -268,17 +368,25 @@ io.on("connection", (socket) => {
         room.isPlaying = true;
         room.startedAt = Date.now();
 
-        console.log(`▶ ${socket.username} played video at ${room.currentTime}s`);
+        console.log(
+            `▶ ${socket.username} played video at ${room.currentTime}s`
+        );
 
         socket.to(socket.roomId).emit("video_play");
+
+        await persistRoom(room);
     });
 
-    // -------------------------------
+    // ===============================
     // PAUSE VIDEO
-    // -------------------------------
-    socket.on("video_pause", (time) => {
+    // ===============================
+
+    socket.on("video_pause", async (time) => {
         if (!canControl(socket)) {
-            socket.emit("permission_denied", "Participants cannot control video playback.");
+            socket.emit(
+                "permission_denied",
+                "Participants cannot control video playback."
+            );
             return;
         }
 
@@ -295,17 +403,25 @@ io.on("connection", (socket) => {
         room.isPlaying = false;
         room.startedAt = null;
 
-        console.log(`⏸ ${socket.username} paused video at ${room.currentTime}s`);
+        console.log(
+            `⏸ ${socket.username} paused video at ${room.currentTime}s`
+        );
 
         socket.to(socket.roomId).emit("video_pause");
+
+        await persistRoom(room);
     });
 
-    // -------------------------------
+    // ===============================
     // SEEK VIDEO
-    // -------------------------------
-    socket.on("video_seek", (time) => {
+    // ===============================
+
+    socket.on("video_seek", async (time) => {
         if (!canControl(socket)) {
-            socket.emit("permission_denied", "Participants cannot seek the video.");
+            socket.emit(
+                "permission_denied",
+                "Participants cannot seek the video."
+            );
             return;
         }
 
@@ -321,17 +437,25 @@ io.on("connection", (socket) => {
             room.startedAt = Date.now();
         }
 
-        console.log(`⏩ ${socket.username} seeked to ${time}s`);
+        console.log(
+            `⏩ ${socket.username} seeked to ${time}s`
+        );
 
         socket.to(socket.roomId).emit("video_seek", time);
+
+        await persistRoom(room);
     });
 
-    // -------------------------------
+    // ===============================
     // ASSIGN ROLE
-    // -------------------------------
-    socket.on("assign_role", ({ userId, role }) => {
+    // ===============================
+
+    socket.on("assign_role", async ({ userId, role }) => {
         if (socket.role !== "host") {
-            socket.emit("permission_denied", "Only Host can assign roles.");
+            socket.emit(
+                "permission_denied",
+                "Only Host can assign roles."
+            );
             return;
         }
 
@@ -346,6 +470,7 @@ io.on("connection", (socket) => {
         room.participants[userId].role = role;
 
         const targetSocket = io.sockets.sockets.get(userId);
+
         if (targetSocket) {
             targetSocket.role = role;
         }
@@ -353,15 +478,22 @@ io.on("connection", (socket) => {
         console.log(`🛡️ Role of ${userId} changed to ${role}`);
 
         io.to(userId).emit("role_updated", role);
+
+        await persistRoom(room);
+
         sendParticipants(socket.roomId);
     });
 
-    // -------------------------------
-    // TRANSFER HOST (BONUS)
-    // -------------------------------
-    socket.on("transfer_host", (newHostUserId) => {
+    // ===============================
+    // TRANSFER HOST
+    // ===============================
+
+    socket.on("transfer_host", async (newHostUserId) => {
         if (socket.role !== "host") {
-            socket.emit("permission_denied", "Only the current Host can transfer host privileges.");
+            socket.emit(
+                "permission_denied",
+                "Only the current Host can transfer host privileges."
+            );
             return;
         }
 
@@ -369,7 +501,10 @@ io.on("connection", (socket) => {
 
         const room = rooms[socket.roomId];
 
-        if (!room.participants[newHostUserId] || newHostUserId === socket.id) {
+        if (
+            !room.participants[newHostUserId] ||
+            newHostUserId === socket.id
+        ) {
             return;
         }
 
@@ -377,18 +512,22 @@ io.on("connection", (socket) => {
         room.participants[socket.id].role = "moderator";
         socket.role = "moderator";
 
-        // Target user becomes host
+        // New host
         room.participants[newHostUserId].role = "host";
         room.hostId = newHostUserId;
 
         const targetSocket = io.sockets.sockets.get(newHostUserId);
+
         if (targetSocket) {
             targetSocket.role = "host";
         }
 
-        console.log(`👑 Host transferred from ${socket.username} to ${room.participants[newHostUserId].username}`);
+        console.log(
+            `👑 Host transferred from ${socket.username} to ${room.participants[newHostUserId].username}`
+        );
 
         socket.emit("role_updated", "moderator");
+
         io.to(newHostUserId).emit("role_updated", "host");
 
         io.to(socket.roomId).emit("host_transferred", {
@@ -396,15 +535,21 @@ io.on("connection", (socket) => {
             newHostName: room.participants[newHostUserId].username
         });
 
+        await persistRoom(room);
+
         sendParticipants(socket.roomId);
     });
 
-    // -------------------------------
+    // ===============================
     // REMOVE PARTICIPANT
-    // -------------------------------
-    socket.on("remove_participant", (userId) => {
+    // ===============================
+
+    socket.on("remove_participant", async (userId) => {
         if (socket.role !== "host") {
-            socket.emit("permission_denied", "Only Host can remove participants.");
+            socket.emit(
+                "permission_denied",
+                "Only Host can remove participants."
+            );
             return;
         }
 
@@ -421,28 +566,38 @@ io.on("connection", (socket) => {
         io.to(userId).emit("participant_removed");
 
         const targetSocket = io.sockets.sockets.get(userId);
+
         if (targetSocket) {
             targetSocket.leave(socket.roomId);
             targetSocket.roomId = null;
             targetSocket.role = null;
         }
 
-        console.log(`❌ ${userId} removed from room ${socket.roomId}`);
+        console.log(
+            `❌ ${userId} removed from room ${socket.roomId}`
+        );
+
+        await persistRoom(room);
 
         sendParticipants(socket.roomId);
     });
 
-    // -------------------------------
-    // LIVE ROOM CHAT (BONUS)
-    // -------------------------------
+    // ===============================
+    // LIVE ROOM CHAT
+    // ===============================
+
     socket.on("send_chat_message", (text) => {
         if (!socket.roomId || !rooms[socket.roomId]) return;
 
         if (typeof text !== "string" || !text.trim()) return;
 
         const room = rooms[socket.roomId];
+
         const messageData = {
-            id: Date.now().toString() + Math.random().toString(36).substr(2, 4),
+            id:
+                Date.now().toString() +
+                Math.random().toString(36).substr(2, 4),
+
             userId: socket.id,
             username: socket.username || "Anonymous",
             role: socket.role || "participant",
@@ -451,6 +606,7 @@ io.on("connection", (socket) => {
         };
 
         room.chatMessages.push(messageData);
+
         if (room.chatMessages.length > 100) {
             room.chatMessages.shift();
         }
@@ -458,13 +614,22 @@ io.on("connection", (socket) => {
         io.to(socket.roomId).emit("chat_message", messageData);
     });
 
-    // -------------------------------
-    // EMOJI REACTIONS (BONUS)
-    // -------------------------------
+    // ===============================
+    // EMOJI REACTIONS
+    // ===============================
+
     socket.on("send_reaction", (emoji) => {
         if (!socket.roomId || !rooms[socket.roomId]) return;
 
-        const allowedEmojis = ["❤️", "🔥", "🎉", "😂", "👏", "👍"];
+        const allowedEmojis = [
+            "❤️",
+            "🔥",
+            "🎉",
+            "😂",
+            "👏",
+            "👍"
+        ];
+
         if (!allowedEmojis.includes(emoji)) return;
 
         socket.to(socket.roomId).emit("reaction_received", {
@@ -474,13 +639,15 @@ io.on("connection", (socket) => {
         });
     });
 
-    // -------------------------------
+    // ===============================
     // DISCONNECT
-    // -------------------------------
-    socket.on("disconnect", () => {
+    // ===============================
+
+    socket.on("disconnect", async () => {
         console.log(`❌ User disconnected: ${socket.id}`);
 
         const roomId = socket.roomId;
+
         if (!roomId || !rooms[roomId]) return;
 
         const room = rooms[roomId];
@@ -488,44 +655,76 @@ io.on("connection", (socket) => {
         delete room.participants[socket.id];
 
         socket.to(roomId).emit("user_left", socket.id);
-        sendParticipants(roomId);
 
-        // Auto host assignment if original host left
+        // ===============================
+        // HOST LEFT
+        // ===============================
+
         if (socket.id === room.hostId) {
-            const remainingParticipantIds = Object.keys(room.participants);
+            const remainingParticipantIds =
+                Object.keys(room.participants);
 
             if (remainingParticipantIds.length > 0) {
                 const newHostId = remainingParticipantIds[0];
+
                 room.hostId = newHostId;
+
                 room.participants[newHostId].role = "host";
 
-                const newHostSocket = io.sockets.sockets.get(newHostId);
+                const newHostSocket =
+                    io.sockets.sockets.get(newHostId);
+
                 if (newHostSocket) {
                     newHostSocket.role = "host";
                 }
 
-                io.to(newHostId).emit("role_updated", "host");
+                io.to(newHostId).emit(
+                    "role_updated",
+                    "host"
+                );
+
                 io.to(roomId).emit("host_transferred", {
                     newHostId: newHostId,
-                    newHostName: room.participants[newHostId].username
+                    newHostName:
+                        room.participants[newHostId].username
                 });
 
-                sendParticipants(roomId);
+                console.log(
+                    `👑 New host: ${room.participants[newHostId].username}`
+                );
             }
         }
 
-        // Cleanup empty room
+        // ===============================
+        // ROOM EMPTY
+        // ===============================
+
         if (Object.keys(room.participants).length === 0) {
             delete rooms[roomId];
-            roomService.deleteRoom(roomId);
+
+            await roomService.deleteRoom(roomId);
+
             console.log(`🧹 Room cleaned up: ${roomId}`);
+
+            return;
         }
+
+        // Persist remaining participants / host
+        await persistRoom(room);
+
+        io.to(roomId).emit(
+            "participants_updated",
+            Object.values(room.participants)
+        );
     });
 });
 
 // ===============================
 // START SERVER
 // ===============================
+
 server.listen(PORT, () => {
-    console.log(`🚀 Watch Party Server running on port ${PORT}`);
+    console.log(
+        `🚀 Watch Party Server running on port ${PORT}`
+    );
 });

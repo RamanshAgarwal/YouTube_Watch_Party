@@ -218,6 +218,14 @@ Open `http://localhost:5173` in multiple browser windows or tabs to simulate mul
 
 ---
 
+
+## 🌐 Live Demo
+
+🚀 **Live Application:** https://youtube-watch-party-client-lduo.onrender.com
+
+The application is publicly deployed and can be accessed using the link above.
+
+
 ## 🌐 Production Deployment Guide
 
 ### Deploying Backend (Render / Railway)

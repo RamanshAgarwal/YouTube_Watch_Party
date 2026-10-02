@@ -76,7 +76,7 @@ function YouTubePlayer({
                 playerRef.current = null;
             }
         };
-    }, [videoId]);
+    }, [videoId,role]);
 
     // --------------------------------
     // PLAYER READY
